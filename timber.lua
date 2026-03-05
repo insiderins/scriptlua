@@ -48,6 +48,9 @@ local Settings = {
     SellPerItemDelayWhenFarmActive = 0.11,
     SellPromptCacheInterval = 3,
     TapSafePositionRefreshInterval = 0.25,
+    TapUseOffscreenPosition = true,
+    TapOffscreenX = -32000,
+    TapOffscreenY = -32000,
     CameraLockOnFirstChopOnly = true,
     AimNearestObject = true,
     AimMaxDistance = 180,
@@ -1294,6 +1297,28 @@ function isGuiObjectTapBlocker(obj)
         return true
     end
 
+    -- Treat visible foreign GUI surfaces as blockers so auto tap never clicks through them.
+    local size = obj.AbsoluteSize
+    if size and size.X >= 24 and size.Y >= 24 then
+        local bgTransparency = 1
+        pcall(function()
+            bgTransparency = obj.BackgroundTransparency
+        end)
+        if type(bgTransparency) == "number" and bgTransparency < 0.98 then
+            return true
+        end
+
+        if obj:IsA("ImageLabel") or obj:IsA("ImageButton") then
+            local imageTransparency = 1
+            pcall(function()
+                imageTransparency = obj.ImageTransparency
+            end)
+            if type(imageTransparency) == "number" and imageTransparency < 0.98 then
+                return true
+            end
+        end
+    end
+
     return false
 end
 
@@ -1379,22 +1404,50 @@ function getTapPosition(forceRefresh)
             end
         end
 
-        lastTapX = candidates[2][1]
-        lastTapY = candidates[2][2]
-        lastTapPositionAt = now
-        return candidates[2][1], candidates[2][2]
+        return nil, nil
     end
 
-    lastTapX = 640
-    lastTapY = 360
-    lastTapPositionAt = now
-    return lastTapX, lastTapY
+    return nil, nil
 end
 
-function sendTap(isDown, x, y)
+function getOffscreenTapPosition()
+    if Settings.TapUseOffscreenPosition ~= true then
+        return nil, nil
+    end
+
+    local offscreenX = tonumber(Settings.TapOffscreenX)
+    local offscreenY = tonumber(Settings.TapOffscreenY)
+    if offscreenX and offscreenY then
+        return math.floor(offscreenX), math.floor(offscreenY)
+    end
+
+    local camera = workspace.CurrentCamera
+    if camera then
+        local viewport = camera.ViewportSize
+        return math.floor(viewport.X + 240), math.floor(viewport.Y + 240)
+    end
+
+    return -32000, -32000
+end
+
+function sendTap(isDown, x, y, useOffscreen)
     local tapX, tapY = x, y
+    if useOffscreen then
+        local offX, offY = getOffscreenTapPosition()
+        if offX and offY then
+            tapX, tapY = offX, offY
+        end
+    end
+
     if not tapX or not tapY then
         tapX, tapY = getTapPosition(false)
+    end
+    if not tapX or not tapY then
+        return false
+    end
+
+    if not useOffscreen and isPointBlockedByGameGui(tapX, tapY) then
+        return false
     end
 
     local ok = pcall(function()
@@ -1402,7 +1455,7 @@ function sendTap(isDown, x, y)
     end)
 
     if ok then
-        return
+        return true
     end
 
     pcall(function()
@@ -1412,13 +1465,30 @@ function sendTap(isDown, x, y)
             VirtualUser:Button1Up(Vector2.new(tapX, tapY), workspace.CurrentCamera and workspace.CurrentCamera.CFrame or CFrame.new())
         end
     end)
+    return true
 end
 
 function performTapCycle()
-    local tapX, tapY = getTapPosition(false)
-    sendTap(true, tapX, tapY)
+    local useOffscreenTap = Settings.TapUseOffscreenPosition == true
+    local tapX, tapY = nil, nil
+    if useOffscreenTap then
+        tapX, tapY = getOffscreenTapPosition()
+    else
+        tapX, tapY = getTapPosition(false)
+    end
+    if not tapX or not tapY then
+        task.wait(math.max(Settings.WaitDuration or 0.15, 0.08))
+        return
+    end
+
+    local pressed = sendTap(true, tapX, tapY, useOffscreenTap)
+    if not pressed then
+        task.wait(math.max(Settings.WaitDuration or 0.15, 0.08))
+        return
+    end
+
     task.wait(Settings.ClickDuration)
-    sendTap(false, tapX, tapY)
+    sendTap(false, tapX, tapY, useOffscreenTap)
     task.wait(Settings.WaitDuration)
 end
 
