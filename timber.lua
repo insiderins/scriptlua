@@ -26,6 +26,7 @@ local Settings = {
     FarmEspMaxDistance = 420,
     ForceTreeInfoRefreshInterval = 0.6,
     ForceTreeInfoMaxTargets = 25,
+    ForceTreeInfoTriggerCooldown = 1.2,
     WeatherMutationScanInterval = 0.45,
     WeatherMutationRepeatBlockSeconds = 180,
     WeatherMutationTargetLifetimeSeconds = 420,
@@ -48,9 +49,6 @@ local Settings = {
     SellPerItemDelayWhenFarmActive = 0.11,
     SellPromptCacheInterval = 3,
     TapSafePositionRefreshInterval = 0.25,
-    TapUseOffscreenPosition = true,
-    TapOffscreenX = -32000,
-    TapOffscreenY = -32000,
     CameraLockOnFirstChopOnly = true,
     AimNearestObject = true,
     AimMaxDistance = 180,
@@ -227,6 +225,7 @@ local refreshFarmUiCallback = nil
 local farmEspEntries = {}
 local farmEspRunning = false
 local forceTreeInfoRunning = false
+local forceTreeInfoTriggerMap = {}
 local sellRemoteCache = {
     LastScanAt = 0,
     Remotes = {}
@@ -1410,34 +1409,8 @@ function getTapPosition(forceRefresh)
     return nil, nil
 end
 
-function getOffscreenTapPosition()
-    if Settings.TapUseOffscreenPosition ~= true then
-        return nil, nil
-    end
-
-    local offscreenX = tonumber(Settings.TapOffscreenX)
-    local offscreenY = tonumber(Settings.TapOffscreenY)
-    if offscreenX and offscreenY then
-        return math.floor(offscreenX), math.floor(offscreenY)
-    end
-
-    local camera = workspace.CurrentCamera
-    if camera then
-        local viewport = camera.ViewportSize
-        return math.floor(viewport.X + 240), math.floor(viewport.Y + 240)
-    end
-
-    return -32000, -32000
-end
-
-function sendTap(isDown, x, y, useOffscreen)
+function sendTap(isDown, x, y)
     local tapX, tapY = x, y
-    if useOffscreen then
-        local offX, offY = getOffscreenTapPosition()
-        if offX and offY then
-            tapX, tapY = offX, offY
-        end
-    end
 
     if not tapX or not tapY then
         tapX, tapY = getTapPosition(false)
@@ -1446,7 +1419,7 @@ function sendTap(isDown, x, y, useOffscreen)
         return false
     end
 
-    if not useOffscreen and isPointBlockedByGameGui(tapX, tapY) then
+    if isPointBlockedByGameGui(tapX, tapY) then
         return false
     end
 
@@ -1469,26 +1442,20 @@ function sendTap(isDown, x, y, useOffscreen)
 end
 
 function performTapCycle()
-    local useOffscreenTap = Settings.TapUseOffscreenPosition == true
-    local tapX, tapY = nil, nil
-    if useOffscreenTap then
-        tapX, tapY = getOffscreenTapPosition()
-    else
-        tapX, tapY = getTapPosition(false)
-    end
+    local tapX, tapY = getTapPosition(false)
     if not tapX or not tapY then
         task.wait(math.max(Settings.WaitDuration or 0.15, 0.08))
         return
     end
 
-    local pressed = sendTap(true, tapX, tapY, useOffscreenTap)
+    local pressed = sendTap(true, tapX, tapY)
     if not pressed then
         task.wait(math.max(Settings.WaitDuration or 0.15, 0.08))
         return
     end
 
     task.wait(Settings.ClickDuration)
-    sendTap(false, tapX, tapY, useOffscreenTap)
+    sendTap(false, tapX, tapY)
     task.wait(Settings.WaitDuration)
 end
 
@@ -4567,14 +4534,22 @@ function detectRobuxPopupAndHandle()
     return true, popupText
 end
 
-function scanFarmObjects(radius)
+function scanFarmObjects(radius, options)
+    options = options or {}
+    local ignoreCooldown = options.IgnoreCooldown == true
+    local ignoreActionPromptSkip = options.IgnoreActionPromptSkip == true
+    local ignoreWeatherMutationTarget = options.IgnoreWeatherMutationTarget == true
+
     local character = player.Character
     local hrp = character and character:FindFirstChild("HumanoidRootPart")
     if not hrp then
         return {}, 0
     end
     local activeTreeFilters = getNormalizedFarmTreeFilters(FarmState.TreeFilter)
-    local weatherMutationTarget = getActiveWeatherMutationTarget()
+    local weatherMutationTarget = nil
+    if not ignoreWeatherMutationTarget then
+        weatherMutationTarget = getActiveWeatherMutationTarget()
+    end
 
     local treesFolder = workspace:FindFirstChild("Trees")
     local nearbyParts = nil
@@ -4638,13 +4613,13 @@ function scanFarmObjects(radius)
                         end
 
                         local targetKey = buildFarmTargetKey(source, targetPart)
-                        if targetKey and isFarmTargetCoolingDown(targetKey) then
+                        if targetKey and (not ignoreCooldown) and isFarmTargetCoolingDown(targetKey) then
                             cooldownSkippedCount = cooldownSkippedCount + 1
                             continue
                         end
 
                         local skipByActionPrompt = false
-                        if hasInteractNode(source, targetPart) then
+                        if (not ignoreActionPromptSkip) and hasInteractNode(source, targetPart) then
                             local shouldSkipAction = shouldSkipFarmTargetByActionPrompt(source, targetPart)
                             if shouldSkipAction then
                                 skipByActionPrompt = true
@@ -4652,7 +4627,7 @@ function scanFarmObjects(radius)
                         end
                         if skipByActionPrompt then
                             cooldownSkippedCount = cooldownSkippedCount + 1
-                            if targetKey and targetKey ~= "" then
+                            if targetKey and targetKey ~= "" and (not ignoreCooldown) then
                                 FarmState.CooldownKeys[targetKey] = {
                                     expiresAt = os.clock() + (Settings.FarmActionPromptSkipCooldownSeconds or 45)
                                 }
@@ -6850,7 +6825,131 @@ function collectTreeInfoNodes(container)
         pushNode(origin:FindFirstChild("TreeHealth", true))
     end
 
+    local descendants = nil
+    pcall(function()
+        descendants = container:GetDescendants()
+    end)
+    if descendants then
+        for _, desc in ipairs(descendants) do
+            local lowerName = string.lower(desc.Name or "")
+            if string.find(lowerName, "treeinfo", 1, true)
+                or string.find(lowerName, "treehealth", 1, true)
+                or string.find(lowerName, "healthbar", 1, true)
+                or string.find(lowerName, "tree_info", 1, true)
+                or string.find(lowerName, "tree_health", 1, true) then
+                pushNode(desc)
+            end
+        end
+    end
+
     return nodes
+end
+
+function canTriggerForceTreeInfoTarget(target)
+    if not target then
+        return false
+    end
+
+    local targetKey = target.key
+    if (not targetKey or targetKey == "") and target.instance and target.part then
+        targetKey = buildFarmTargetKey(target.instance, target.part)
+    end
+    if not targetKey or targetKey == "" then
+        return true
+    end
+
+    local now = os.clock()
+    local cooldown = math.clamp(tonumber(Settings.ForceTreeInfoTriggerCooldown) or 1.2, 0.25, 4)
+    local lastAt = tonumber(forceTreeInfoTriggerMap[targetKey]) or 0
+    if now - lastAt < cooldown then
+        return false
+    end
+
+    forceTreeInfoTriggerMap[targetKey] = now
+    return true
+end
+
+function triggerTreeInfoForTarget(target)
+    if not target or not canTriggerForceTreeInfoTarget(target) then
+        return false
+    end
+
+    local promptCandidates = {}
+    local seenPrompts = {}
+    local negativeHints = {"collect", "harvest", "pickup", "claim", "sell", "vendor", "shop", "trade"}
+    local function collectPrompts(root)
+        if not root then
+            return
+        end
+        for _, prompt in ipairs(getEnabledPromptsCached(root, 0.5)) do
+            if prompt and prompt.Parent and not seenPrompts[prompt] then
+                seenPrompts[prompt] = true
+                local contextText = string.lower(cleanGuiText(string.format(
+                    "%s %s %s",
+                    prompt.ActionText or "",
+                    prompt.ObjectText or "",
+                    prompt.Name or ""
+                )))
+                local score = 0
+                if string.find(contextText, "tree", 1, true) then
+                    score = score + 2
+                end
+                if string.find(contextText, "info", 1, true)
+                    or string.find(contextText, "health", 1, true)
+                    or string.find(contextText, "inspect", 1, true) then
+                    score = score + 5
+                end
+                if string.find(contextText, "chop", 1, true)
+                    or string.find(contextText, "hit", 1, true)
+                    or string.find(contextText, "tap", 1, true) then
+                    score = score + 1
+                end
+                if lowerContainsHint(contextText, negativeHints) then
+                    score = score - 6
+                end
+                promptCandidates[#promptCandidates + 1] = {
+                    prompt = prompt,
+                    score = score
+                }
+            end
+        end
+    end
+
+    collectPrompts(target.instance)
+    collectPrompts(target.part)
+
+    table.sort(promptCandidates, function(a, b)
+        return a.score > b.score
+    end)
+
+    for i = 1, math.min(3, #promptCandidates) do
+        local candidate = promptCandidates[i]
+        if candidate and candidate.prompt and candidate.score >= 0 then
+            if sendInteractAction(candidate.prompt) then
+                return true
+            end
+        end
+    end
+
+    if type(fireclickdetector) == "function" then
+        local clickDetector = nil
+        if target.instance and target.instance.Parent then
+            clickDetector = target.instance:FindFirstChildWhichIsA("ClickDetector", true)
+        end
+        if not clickDetector and target.part and target.part.Parent then
+            clickDetector = target.part:FindFirstChildWhichIsA("ClickDetector", true)
+        end
+        if clickDetector then
+            local ok = pcall(function()
+                fireclickdetector(clickDetector)
+            end)
+            if ok then
+                return true
+            end
+        end
+    end
+
+    return false
 end
 
 function setTreeInfoNodeVisible(node)
@@ -6907,6 +7006,22 @@ function forceTreeInfoForTarget(target)
     for _, node in ipairs(nodes) do
         if setTreeInfoNodeVisible(node) then
             touchedAny = true
+        end
+    end
+
+    if not touchedAny then
+        local triggered = triggerTreeInfoForTarget(target)
+        if triggered then
+            nodes = collectTreeInfoNodes(source)
+            if #nodes == 0 and target.part and target.part.Parent then
+                nodes = collectTreeInfoNodes(target.part)
+            end
+
+            for _, node in ipairs(nodes) do
+                if setTreeInfoNodeVisible(node) then
+                    touchedAny = true
+                end
+            end
         end
     end
 
@@ -7166,6 +7281,7 @@ function setForceTreeInfoEnabled(enabled)
     FarmState.ForceTreeInfoEnabled = enabled and true or false
 
     if not FarmState.ForceTreeInfoEnabled then
+        forceTreeInfoTriggerMap = {}
         if refreshFarmUiCallback then
             refreshFarmUiCallback(true)
         end
@@ -7192,8 +7308,14 @@ function setForceTreeInfoEnabled(enabled)
             local scanResults = nil
             if FarmState.Active and type(FarmState.ScanResults) == "table" and #FarmState.ScanResults > 0 then
                 scanResults = FarmState.ScanResults
-            else
-                scanResults = scanFarmObjects(FarmState.Radius)
+            end
+
+            if not scanResults or #scanResults == 0 then
+                scanResults = scanFarmObjects(FarmState.Radius, {
+                    IgnoreCooldown = true,
+                    IgnoreActionPromptSkip = true,
+                    IgnoreWeatherMutationTarget = true
+                })
                 if not FarmState.Active then
                     FarmState.ScanResults = scanResults
                     FarmState.CurrentTarget = scanResults[1]
@@ -7211,6 +7333,7 @@ function setForceTreeInfoEnabled(enabled)
         end
 
         forceTreeInfoRunning = false
+        forceTreeInfoTriggerMap = {}
         if not screenGui or screenGui.Parent == nil then
             FarmState.ForceTreeInfoEnabled = false
         end
