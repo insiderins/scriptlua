@@ -20,6 +20,15 @@ local Settings = {
     FarmNoPacketSkipSeconds = 2.2,
     FarmUiScanInterval = 0.3,
     FarmUiRefreshInterval = 0.12,
+    FarmUiListMaxLines = 12,
+    FarmEspRefreshInterval = 0.65,
+    FarmEspMaxEntries = 30,
+    FarmEspMaxDistance = 420,
+    ForceTreeInfoRefreshInterval = 0.6,
+    ForceTreeInfoMaxTargets = 25,
+    WeatherMutationScanInterval = 0.45,
+    WeatherMutationRepeatBlockSeconds = 180,
+    WeatherMutationTargetLifetimeSeconds = 420,
     FarmHpRescanInterval = 0.35,
     FarmHpProbeRetryInterval = 2.5,
     FarmPlayerNearbySkipRadius = 24,
@@ -30,6 +39,7 @@ local Settings = {
     HarvestCacheResetSeconds = 300,
     HarvestPlotArrivalDistance = 24,
     HarvestPlotArrivalTimeout = 2.8,
+    HarvestPostTeleportDelaySeconds = 0,
     HarvestPromptCacheInterval = 1.2,
     SellGuiHoldSeconds = 0.14,
     SellGuiCardScanInterval = 1.4,
@@ -74,6 +84,7 @@ local FarmState = {
     Radius = 120,
     ZoneIndex = 1,
     TreeFilter = "",
+    PriorityMode = "HP",
     ScanResults = {},
     CurrentTarget = nil,
     LockedTarget = nil,
@@ -84,7 +95,15 @@ local FarmState = {
     LastConflictAt = 0,
     LastBusyToastScanAt = 0,
     LastBusyToastText = nil,
-    LastWideScanAt = 0
+    LastWideScanAt = 0,
+    LastWeatherMutationScanAt = 0,
+    LastWeatherMutationMessageKey = nil,
+    LastWeatherMutationMessageAt = 0,
+    LastWeatherMutationHandledKey = nil,
+    WeatherMutationEnabled = true,
+    EspEnabled = false,
+    ForceTreeInfoEnabled = false,
+    WeatherMutationTarget = nil
 }
 
 local HarvestState = {
@@ -141,14 +160,16 @@ local FarmPacketState = {
     RemoteConnections = {}
 }
 
-local HP_KEYS = {"HP", "Health", "HitPoints", "Durability", "CurrentHP", "TreeHP", "BreakPoint", "Breakpoint"}
+local HP_KEYS = {"HP", "Health", "HitPoints", "Durability", "CurrentHP", "TreeHP"}
 local MAX_HP_KEYS = {"MaxHP", "MaxHealth", "HealthMax", "DurabilityMax", "HPMax", "MaxBreakPoint", "BreakPointMax"}
 local RARITY_KEYS = {"Rarity", "Tier", "Class", "Type"}
+local MUTATION_KEYS = {"Mutation", "Mutations", "Modifier", "Modifiers", "Mutant", "Mutate"}
 local OWNER_KEYS = {"Owner", "OwnerName", "Player", "PlayerName", "User", "UserId", "OwnerId"}
 local INTERACT_HINTS = {"collect", "harvest", "pickup", "pick", "take", "claim", "wood", "log", "tree", "fruit"}
 local PLOT_HINTS = {"plot", "base", "property", "homestead", "land"}
 local FARM_OBJECT_HINTS = {"tree", "log", "wood", "chop", "stump", "trunk"}
-local HEALTH_NAME_HINTS = {"hp", "health", "durability", "life", "hit", "break"}
+local HEALTH_NAME_HINTS = {"hp", "health", "durability", "life", "hit"}
+local MUTATION_NAME_HINTS = {"mutation", "mutations", "mutate", "modifier", "modifiers", "variant"}
 local NON_FARM_HINTS = {"bound", "zone", "plot", "base", "ground", "floor", "terrain", "water", "wall", "spawn"}
 local PACKET_HINTS = {"bytenet", "tree", "chop", "wood", "damage", "hit", "break", "axe", "swing", "harvest", "resource"}
 local FARM_BUSY_HINTS = {"already chopping this tree", "try again in"}
@@ -161,6 +182,18 @@ local SELL_DIALOG_OPTION_TWO_HINTS = {"i want to sell this", "sell this"}
 local TOOL_SLOT_KEYS = {"Slot", "HotbarSlot", "InventorySlot", "Index", "Order"}
 local COUNT_VALUE_KEYS = {"Count", "Amount", "Qty", "Quantity", "Stack", "Stacks", "Total", "Value"}
 local WEIGHT_VALUE_KEYS = {"Weight", "weight", "Mass", "Kg", "KG"}
+local FARM_RARITY_WORD_SCORES = {
+    common = 1,
+    uncommon = 2,
+    rare = 3,
+    epic = 4,
+    legendary = 5,
+    mythic = 6,
+    divine = 7,
+    godly = 8,
+    exotic = 9,
+    unique = 10
+}
 
 local connections = {}
 local cameraLockConnection = nil
@@ -188,6 +221,9 @@ local robuxPopupCache = {
 }
 local farmViewLastRefreshAt = 0
 local refreshFarmUiCallback = nil
+local farmEspEntries = {}
+local farmEspRunning = false
+local forceTreeInfoRunning = false
 local sellRemoteCache = {
     LastScanAt = 0,
     Remotes = {}
@@ -241,7 +277,11 @@ function buildConfigSnapshot()
         Farm = {
             Radius = FarmState.Radius,
             ZoneIndex = FarmState.ZoneIndex,
-            TreeFilter = FarmState.TreeFilter
+            TreeFilter = FarmState.TreeFilter,
+            PriorityMode = normalizeFarmPriorityMode(FarmState.PriorityMode),
+            WeatherMutationEnabled = FarmState.WeatherMutationEnabled,
+            EspEnabled = FarmState.EspEnabled,
+            ForceTreeInfoEnabled = FarmState.ForceTreeInfoEnabled
         },
         Sell = {
             NameFilter = SellState.NameFilter,
@@ -270,12 +310,8 @@ function syncStateFromUiForConfigSave()
         end
     end
     if farmTreeFilterInput and type(farmTreeFilterInput.Text) == "string" then
-        local treeFilter = string.gsub(farmTreeFilterInput.Text or "", "^%s*(.-)%s*$", "%1")
-        local lowerTreeFilter = string.lower(treeFilter)
-        if lowerTreeFilter == "all" or lowerTreeFilter == "semua" then
-            treeFilter = ""
-        end
-        FarmState.TreeFilter = treeFilter
+        local normalizedTreeFilter = normalizeFarmTreeFilterInput(farmTreeFilterInput.Text)
+        FarmState.TreeFilter = normalizedTreeFilter
     end
 
     if sellNameFilterInput and type(sellNameFilterInput.Text) == "string" then
@@ -400,14 +436,22 @@ function loadConfigFromDisk()
             FarmState.ZoneIndex = math.max(1, math.floor(zoneIndex))
         end
         if type(farmConfig.TreeFilter) == "string" then
-            local loadedFilter = string.gsub(farmConfig.TreeFilter, "^%s*(.-)%s*$", "%1")
-            local lowerLoadedFilter = string.lower(loadedFilter)
-            if lowerLoadedFilter == "all" or lowerLoadedFilter == "semua" then
-                loadedFilter = ""
-            end
-            FarmState.TreeFilter = loadedFilter
+            FarmState.TreeFilter = normalizeFarmTreeFilterInput(farmConfig.TreeFilter)
+        end
+        if type(farmConfig.PriorityMode) == "string" then
+            FarmState.PriorityMode = farmConfig.PriorityMode
+        end
+        if type(farmConfig.WeatherMutationEnabled) == "boolean" then
+            FarmState.WeatherMutationEnabled = farmConfig.WeatherMutationEnabled
+        end
+        if type(farmConfig.EspEnabled) == "boolean" then
+            FarmState.EspEnabled = farmConfig.EspEnabled
+        end
+        if type(farmConfig.ForceTreeInfoEnabled) == "boolean" then
+            FarmState.ForceTreeInfoEnabled = farmConfig.ForceTreeInfoEnabled
         end
     end
+    FarmState.PriorityMode = normalizeFarmPriorityMode(FarmState.PriorityMode)
 
     local sellConfig = config.Sell
     if type(sellConfig) == "table" then
@@ -1602,6 +1646,114 @@ function normalizeFarmTreeText(value)
     text = string.gsub(text, "%s+", " ")
     text = string.gsub(text, "^%s*(.-)%s*$", "%1")
     return text
+end
+
+function normalizeFarmPriorityMode(mode)
+    local normalized = normalizeFarmTreeText(mode)
+    if normalized == "rarity" or normalized == "highest rarity" then
+        return "RARITY"
+    end
+    return "HP"
+end
+
+function getFarmPriorityModeLabel(mode)
+    local normalized = normalizeFarmPriorityMode(mode)
+    if normalized == "RARITY" then
+        return "Highest Rarity"
+    end
+    return "Highest HP"
+end
+
+function parseFarmRarityScore(rarityText)
+    if rarityText == nil then
+        return 0
+    end
+
+    local text = cleanGuiText(tostring(rarityText))
+    if text == "" then
+        return 0
+    end
+
+    local numeric = parseCurrencyPerSecondText(text)
+    if not numeric then
+        local token = string.match(string.lower(text), "([%d%.,]+[kmb]?)")
+        if token then
+            numeric = parseCompactNumber(token)
+        end
+    end
+    if numeric and numeric > 0 then
+        return numeric
+    end
+
+    local lowerText = normalizeFarmTreeText(text)
+    local bestWordScore = 0
+    for rarityWord, rarityScore in pairs(FARM_RARITY_WORD_SCORES) do
+        if string.find(lowerText, rarityWord, 1, true) then
+            if rarityScore > bestWordScore then
+                bestWordScore = rarityScore
+            end
+        end
+    end
+    return bestWordScore
+end
+
+function compareFarmTargets(a, b)
+    local priorityMode = normalizeFarmPriorityMode(FarmState.PriorityMode)
+    if priorityMode == "RARITY" then
+        local aRarityScore = parseFarmRarityScore(a and a.rarity)
+        local bRarityScore = parseFarmRarityScore(b and b.rarity)
+        if aRarityScore ~= bRarityScore then
+            return aRarityScore > bRarityScore
+        end
+    end
+
+    local aHp = tonumber(a and a.hp) or 0
+    local bHp = tonumber(b and b.hp) or 0
+    if aHp ~= bHp then
+        return aHp > bHp
+    end
+
+    local aDistance = tonumber(a and a.distance) or math.huge
+    local bDistance = tonumber(b and b.distance) or math.huge
+    return aDistance < bDistance
+end
+
+function normalizeFarmTreeFilterInput(rawFilter)
+    local sourceText = tostring(rawFilter or "")
+    sourceText = string.gsub(sourceText, "[\r\n]+", ",")
+
+    local displayTokens = {}
+    local seenNormalized = {}
+    for token in string.gmatch(sourceText, "([^,;|]+)") do
+        local trimmed = string.gsub(token, "^%s*(.-)%s*$", "%1")
+        local normalized = normalizeFarmTreeText(trimmed)
+        if normalized ~= ""
+            and normalized ~= "all"
+            and normalized ~= "semua"
+            and not seenNormalized[normalized] then
+            seenNormalized[normalized] = true
+            table.insert(displayTokens, trimmed)
+        end
+    end
+
+    return table.concat(displayTokens, ", ")
+end
+
+function getNormalizedFarmTreeFilters(rawFilter)
+    local normalizedInput = normalizeFarmTreeFilterInput(rawFilter)
+    if normalizedInput == "" then
+        return {}
+    end
+
+    local normalizedFilters = {}
+    for token in string.gmatch(normalizedInput, "([^,]+)") do
+        local normalized = normalizeFarmTreeText(token)
+        if normalized ~= "" then
+            table.insert(normalizedFilters, normalized)
+        end
+    end
+
+    return normalizedFilters
 end
 
 function getToolCountValue(tool, preferredKey)
@@ -2894,10 +3046,60 @@ end
 
 function getPromptScore(prompt)
     local sourceText = string.format("%s %s %s", prompt.ActionText or "", prompt.ObjectText or "", prompt.Parent and prompt.Parent.Name or "")
+    local score = 1
+
     if lowerContainsHint(sourceText, INTERACT_HINTS) then
-        return 2
+        score = score + 2
     end
-    return 1
+
+    local keyIsE = false
+    pcall(function()
+        keyIsE = prompt.KeyboardKeyCode == Enum.KeyCode.E
+    end)
+    if keyIsE then
+        score = score + 3
+    end
+
+    local actionText = string.lower(cleanGuiText(prompt.ActionText or ""))
+    local objectText = string.lower(cleanGuiText(prompt.ObjectText or ""))
+    local nameText = string.lower(cleanGuiText(prompt.Name or ""))
+    local isCollectPrompt = string.find(actionText, "collect", 1, true)
+        or string.find(objectText, "collect", 1, true)
+        or string.find(nameText, "collect", 1, true)
+    if isCollectPrompt then
+        score = score + 8
+    end
+
+    return score
+end
+
+function isHarvestCollectTreePrompt(prompt, part, root)
+    if not prompt then
+        return false
+    end
+
+    local actionText = string.lower(cleanGuiText(prompt.ActionText or ""))
+    if string.find(actionText, "collect", 1, true) == nil then
+        return false
+    end
+
+    local objectText = string.lower(cleanGuiText(prompt.ObjectText or ""))
+    local promptName = string.lower(cleanGuiText(prompt.Name or ""))
+    local partName = part and string.lower(cleanGuiText(part.Name or "")) or ""
+    local rootName = root and string.lower(cleanGuiText(root.Name or "")) or ""
+    local hasTreeHint = string.find(objectText, "tree", 1, true)
+        or string.find(promptName, "tree", 1, true)
+        or string.find(partName, "tree", 1, true)
+        or string.find(rootName, "tree", 1, true)
+    if not hasTreeHint then
+        return false
+    end
+
+    local keyIsE = false
+    pcall(function()
+        keyIsE = prompt.KeyboardKeyCode == Enum.KeyCode.E
+    end)
+    return keyIsE
 end
 
 function getWorkspacePromptList(forceRefresh, maxAgeSeconds)
@@ -3061,10 +3263,19 @@ function scanHarvestObjects(radius)
     end
 
     local results = {}
-    local hintedResults = {}
     local seenPrompts = {}
-    local seenKeys = {}
+    local bestPerKey = {}
     local blockedCount = 0
+
+    local function shouldReplaceEntry(existing, candidate)
+        if not existing then
+            return true
+        end
+        if candidate.score == existing.score then
+            return candidate.distance < existing.distance
+        end
+        return candidate.score > existing.score
+    end
 
     local prompts = getWorkspacePromptList(false, Settings.HarvestPromptCacheInterval)
     for _, obj in ipairs(prompts) do
@@ -3078,46 +3289,53 @@ function scanHarvestObjects(radius)
                 local distance = (part.Position - hrp.Position).Magnitude
                 if distance <= radius then
                     local targetKey, rootInstance = buildHarvestTargetKey(part, obj)
-                    if targetKey and isHarvestKeyBlocked(targetKey) then
+                    if not isHarvestCollectTreePrompt(obj, part, rootInstance) then
+                        continue
+                    end
+
+                    local dedupeKey = targetKey
+                    if not dedupeKey then
+                        local promptPath = nil
+                        pcall(function()
+                            promptPath = obj:GetFullName()
+                        end)
+                        dedupeKey = "prompt|" .. tostring(promptPath or obj)
+                    end
+                    if isHarvestKeyBlocked(dedupeKey) then
                         blockedCount = blockedCount + 1
                         continue
-                    end
-                    if targetKey and seenKeys[targetKey] then
-                        continue
-                    end
-                    if targetKey then
-                        seenKeys[targetKey] = true
                     end
 
                     local entry = {
                         prompt = obj,
                         part = part,
                         root = rootInstance,
-                        key = targetKey,
+                        key = dedupeKey,
                         distance = distance,
                         score = getPromptScore(obj),
                         name = part.Name
                     }
 
-                    table.insert(results, entry)
-                    if entry.score > 1 then
-                        table.insert(hintedResults, entry)
+                    if shouldReplaceEntry(bestPerKey[dedupeKey], entry) then
+                        bestPerKey[dedupeKey] = entry
                     end
                 end
             end
         end
     end
 
-    local finalResults = (#hintedResults > 0) and hintedResults or results
+    for _, entry in pairs(bestPerKey) do
+        table.insert(results, entry)
+    end
 
-    table.sort(finalResults, function(a, b)
+    table.sort(results, function(a, b)
         if a.score == b.score then
             return a.distance < b.distance
         end
         return a.score > b.score
     end)
 
-    return finalResults, blockedCount
+    return results, blockedCount
 end
 
 function isMobileClient()
@@ -3126,6 +3344,14 @@ end
 
 function sendInteractAction(prompt)
     local holdDuration = prompt and prompt.HoldDuration or 0
+    local interactKey = Enum.KeyCode.E
+    if prompt then
+        pcall(function()
+            if prompt.KeyboardKeyCode and prompt.KeyboardKeyCode ~= Enum.KeyCode.Unknown then
+                interactKey = prompt.KeyboardKeyCode
+            end
+        end)
+    end
 
     if prompt and type(fireproximityprompt) == "function" then
         local ok = pcall(function()
@@ -3144,11 +3370,11 @@ function sendInteractAction(prompt)
     end
 
     local keyDownOk = pcall(function()
-        VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.E, false, game)
+        VirtualInputManager:SendKeyEvent(true, interactKey, false, game)
     end)
     task.wait(math.max(holdDuration, 0.08))
     local keyUpOk = pcall(function()
-        VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.E, false, game)
+        VirtualInputManager:SendKeyEvent(false, interactKey, false, game)
     end)
 
     if keyDownOk and keyUpOk then
@@ -3274,7 +3500,233 @@ function readHintedNumberValue(container, hints)
     return best
 end
 
+function findNamedTreeUiContainer(container, nodeName)
+    if not container then
+        return nil
+    end
+
+    local treeNode = container:FindFirstChild(nodeName, true)
+    if not treeNode then
+        local origin = container:FindFirstChild("Origin", true)
+        if origin then
+            treeNode = origin:FindFirstChild(nodeName, true)
+        end
+    end
+    if not treeNode then
+        return nil
+    end
+
+    return treeNode:FindFirstChild("Container", true)
+end
+
+function findTreeHealthUiContainer(container)
+    return findNamedTreeUiContainer(container, "TreeHealth")
+end
+
+function findTreeInfoUiContainer(container)
+    return findNamedTreeUiContainer(container, "TreeInfo")
+end
+
+function readTreeHealthUiNodeText(node)
+    if not node then
+        return ""
+    end
+
+    if node:IsA("TextLabel") or node:IsA("TextButton") or node:IsA("TextBox") then
+        return cleanGuiText(node.Text or "")
+    end
+    if node:IsA("StringValue") then
+        return cleanGuiText(node.Value or "")
+    end
+    if node:IsA("NumberValue") or node:IsA("IntValue") then
+        return cleanGuiText(tostring(node.Value))
+    end
+
+    local textObj = node:FindFirstChildWhichIsA("TextLabel", true)
+        or node:FindFirstChildWhichIsA("TextButton", true)
+        or node:FindFirstChildWhichIsA("TextBox", true)
+    if textObj then
+        return cleanGuiText(textObj.Text or "")
+    end
+
+    local stringObj = node:FindFirstChildWhichIsA("StringValue", true)
+    if stringObj then
+        return cleanGuiText(stringObj.Value or "")
+    end
+
+    local numberObj = node:FindFirstChildWhichIsA("NumberValue", true)
+        or node:FindFirstChildWhichIsA("IntValue", true)
+    if numberObj then
+        return cleanGuiText(tostring(numberObj.Value))
+    end
+
+    return ""
+end
+
+function parseTreeHealthDisplayText(text)
+    local lowerText = string.lower(cleanGuiText(text))
+    if lowerText == "" then
+        return nil, nil
+    end
+
+    local currentToken, maxToken = string.match(lowerText, "([%d%.,]+[kmb]?)%s*/%s*([%d%.,]+[kmb]?)")
+    if currentToken then
+        local currentValue = parseCompactNumber(currentToken)
+        local maxValue = parseCompactNumber(maxToken)
+        if currentValue and currentValue > 0 then
+            return currentValue, maxValue
+        end
+    end
+
+    local singleToken = string.match(lowerText, "([%d%.,]+[kmb]?)")
+    if singleToken then
+        local singleValue = parseCompactNumber(singleToken)
+        if singleValue and singleValue > 0 then
+            return singleValue, nil
+        end
+    end
+
+    return nil, nil
+end
+
+function readTreeHealthUiValues(container)
+    local uiContainer = findTreeHealthUiContainer(container)
+    if not uiContainer then
+        return nil, nil, nil
+    end
+
+    local candidates = {}
+    local seen = {}
+    local function pushNode(node)
+        if node and not seen[node] then
+            seen[node] = true
+            candidates[#candidates + 1] = node
+        end
+    end
+
+    local bar = uiContainer:FindFirstChild("Bar", true)
+    if bar then
+        pushNode(bar:FindFirstChild("Title", true))
+        pushNode(bar:FindFirstChild("Tittle", true))
+        pushNode(bar:FindFirstChild("CurrentValue", true))
+    end
+    pushNode(uiContainer:FindFirstChild("Title", true))
+    pushNode(uiContainer:FindFirstChild("Tittle", true))
+    pushNode(uiContainer:FindFirstChild("CurrentValue", true))
+
+    for _, node in ipairs(candidates) do
+        local nodeText = readTreeHealthUiNodeText(node)
+        local currentValue, maxValue = parseTreeHealthDisplayText(nodeText)
+        if currentValue and currentValue > 0 then
+            return currentValue, maxValue, node
+        end
+    end
+
+    return nil, nil, nil
+end
+
+function readTreeRateText(container)
+    local uiContainer = findTreeHealthUiContainer(container)
+    if not uiContainer then
+        return nil
+    end
+
+    local rateNode = uiContainer:FindFirstChild("Rate", true)
+    local rateText = readTreeHealthUiNodeText(rateNode)
+    if rateText ~= "" then
+        return rateText
+    end
+
+    return nil
+end
+
+function normalizeMutationText(text)
+    local cleaned = cleanGuiText(text)
+    if cleaned == "" then
+        return nil
+    end
+
+    cleaned = string.gsub(cleaned, "^[Mm][Uu][Tt][Aa][Tt][Ii][Oo][Nn][Ss]?%s*[:%-]?%s*", "")
+    cleaned = string.gsub(cleaned, "^[%-%*]+%s*", "")
+    cleaned = cleanGuiText(cleaned)
+    if cleaned == "" then
+        return nil
+    end
+
+    local lowerText = string.lower(cleaned)
+    if lowerText == "mutation" or lowerText == "mutations" then
+        return nil
+    end
+
+    return cleaned
+end
+
+function readTreeMutationText(container)
+    local uiContainers = {}
+    local seenContainers = {}
+    local function pushContainer(uiContainer)
+        if uiContainer and not seenContainers[uiContainer] then
+            seenContainers[uiContainer] = true
+            uiContainers[#uiContainers + 1] = uiContainer
+        end
+    end
+
+    pushContainer(findTreeInfoUiContainer(container))
+    pushContainer(findTreeHealthUiContainer(container))
+
+    if #uiContainers == 0 then
+        return nil
+    end
+
+    for _, uiContainer in ipairs(uiContainers) do
+        local candidates = {}
+        local seen = {}
+        local function pushNode(node)
+            if node and not seen[node] then
+                seen[node] = true
+                candidates[#candidates + 1] = node
+            end
+        end
+
+        pushNode(uiContainer:FindFirstChild("Mutations", true))
+        pushNode(uiContainer:FindFirstChild("Mutation", true))
+        pushNode(uiContainer:FindFirstChild("Modifiers", true))
+        pushNode(uiContainer:FindFirstChild("Modifier", true))
+
+        for _, desc in ipairs(uiContainer:GetDescendants()) do
+            local lowerName = string.lower(desc.Name or "")
+            for _, hint in ipairs(MUTATION_NAME_HINTS) do
+                if string.find(lowerName, hint, 1, true) then
+                    pushNode(desc)
+                    break
+                end
+            end
+        end
+
+        for _, node in ipairs(candidates) do
+            local directText = normalizeMutationText(readTreeHealthUiNodeText(node))
+            if directText then
+                return directText
+            end
+
+            for _, text in ipairs(collectGuiTexts(node, 8)) do
+                local parsed = normalizeMutationText(text)
+                if parsed then
+                    return parsed
+                end
+            end
+        end
+    end
+
+    return nil
+end
+
 function readHealthValue(container)
+    local uiCurrent = readTreeHealthUiValues(container)
+    if uiCurrent then
+        return uiCurrent
+    end
+
     local direct = readNumberAttribute(container, HP_KEYS) or readNumberValueObject(container, HP_KEYS)
     if direct then
         return direct
@@ -3296,6 +3748,14 @@ end
 function buildHealthProbe(container)
     if not container then
         return nil
+    end
+
+    local _, _, uiHealthNode = readTreeHealthUiValues(container)
+    if uiHealthNode then
+        return {
+            kind = "tree_text",
+            object = uiHealthNode
+        }
     end
 
     for _, key in ipairs(HP_KEYS) do
@@ -3378,6 +3838,18 @@ function readHealthFromProbe(probe)
         return nil
     end
 
+    if probe.kind == "tree_text" then
+        local object = probe.object
+        if object and object.Parent then
+            local text = readTreeHealthUiNodeText(object)
+            local currentValue = parseTreeHealthDisplayText(text)
+            if currentValue then
+                return currentValue
+            end
+        end
+        return nil
+    end
+
     if probe.kind == "humanoid" then
         local humanoid = probe.object
         if humanoid and humanoid.Parent then
@@ -3400,6 +3872,11 @@ function readMaxHealthValue(container)
         return hinted
     end
 
+    local _, uiMax = readTreeHealthUiValues(container)
+    if uiMax and uiMax > 0 then
+        return uiMax
+    end
+
     local humanoid = container and container:FindFirstChildOfClass("Humanoid")
     if humanoid then
         return humanoid.MaxHealth
@@ -3409,7 +3886,21 @@ function readMaxHealthValue(container)
 end
 
 function readRarityValue(container)
-    return readStringAttribute(container, RARITY_KEYS) or readStringValueObject(container, RARITY_KEYS)
+    return readStringAttribute(container, RARITY_KEYS) or readStringValueObject(container, RARITY_KEYS) or readTreeRateText(container)
+end
+
+function readMutationValue(container)
+    local byAttribute = normalizeMutationText(readStringAttribute(container, MUTATION_KEYS))
+    if byAttribute then
+        return byAttribute
+    end
+
+    local byValue = normalizeMutationText(readStringValueObject(container, MUTATION_KEYS))
+    if byValue then
+        return byValue
+    end
+
+    return readTreeMutationText(container)
 end
 
 function getTargetPart(instance)
@@ -3542,30 +4033,75 @@ function getFarmTreeDisplayName(source, part)
     return tostring(displayName)
 end
 
-function doesFarmTreeMatchFilter(source, part, displayName, normalizedFilter)
-    if not normalizedFilter or normalizedFilter == "" then
+function doesFarmTreeMatchFilter(source, part, displayName, normalizedFilters)
+    if type(normalizedFilters) ~= "table" or #normalizedFilters == 0 then
         return true
     end
 
-    if string.find(normalizeFarmTreeText(displayName), normalizedFilter, 1, true) then
-        return true
-    end
-    if source and string.find(normalizeFarmTreeText(source.Name), normalizedFilter, 1, true) then
-        return true
-    end
-    if part and string.find(normalizeFarmTreeText(part.Name), normalizedFilter, 1, true) then
-        return true
+    local displayText = normalizeFarmTreeText(displayName)
+    local sourceText = source and normalizeFarmTreeText(source.Name) or ""
+    local partText = part and normalizeFarmTreeText(part.Name) or ""
+    for _, normalizedFilter in ipairs(normalizedFilters) do
+        if string.find(displayText, normalizedFilter, 1, true) then
+            return true
+        end
+        if sourceText ~= "" and string.find(sourceText, normalizedFilter, 1, true) then
+            return true
+        end
+        if partText ~= "" and string.find(partText, normalizedFilter, 1, true) then
+            return true
+        end
     end
 
     return false
 end
 
 function getFarmTreeFilterLabel()
-    local filterText = string.gsub(tostring(FarmState.TreeFilter or ""), "^%s*(.-)%s*$", "%1")
+    local filterText = normalizeFarmTreeFilterInput(FarmState.TreeFilter)
     if filterText == "" then
         return "All"
     end
     return filterText
+end
+
+function getActiveWeatherMutationTarget()
+    local target = FarmState.WeatherMutationTarget
+    if not target then
+        return nil
+    end
+
+    local expiresAt = tonumber(target.expiresAt) or 0
+    if expiresAt > 0 and os.clock() > expiresAt then
+        FarmState.WeatherMutationTarget = nil
+        return nil
+    end
+
+    return target
+end
+
+function doesMutationMatchWeatherTarget(mutationText, weatherTarget)
+    if not weatherTarget then
+        return true
+    end
+
+    local requiredMutation = normalizeFarmTreeText(weatherTarget.mutationNormalized or weatherTarget.mutation or "")
+    if requiredMutation == "" then
+        return true
+    end
+
+    local candidate = normalizeFarmTreeText(mutationText)
+    if candidate == "" or candidate == "-" then
+        return false
+    end
+
+    if string.find(candidate, requiredMutation, 1, true) then
+        return true
+    end
+    if string.find(requiredMutation, candidate, 1, true) then
+        return true
+    end
+
+    return false
 end
 
 function buildFarmTargetKey(source, part)
@@ -3967,7 +4503,8 @@ function scanFarmObjects(radius)
     if not hrp then
         return {}, 0
     end
-    local activeTreeFilter = normalizeFarmTreeText(FarmState.TreeFilter)
+    local activeTreeFilters = getNormalizedFarmTreeFilters(FarmState.TreeFilter)
+    local weatherMutationTarget = getActiveWeatherMutationTarget()
 
     local treesFolder = workspace:FindFirstChild("Trees")
     local nearbyParts = nil
@@ -4026,7 +4563,7 @@ function scanFarmObjects(radius)
                     local distance = (targetPart.Position - hrp.Position).Magnitude
                     if distance <= radius then
                         local displayName = getFarmTreeDisplayName(source, targetPart)
-                        if activeTreeFilter ~= "" and not doesFarmTreeMatchFilter(source, targetPart, displayName, activeTreeFilter) then
+                        if #activeTreeFilters > 0 and not doesFarmTreeMatchFilter(source, targetPart, displayName, activeTreeFilters) then
                             continue
                         end
 
@@ -4067,6 +4604,27 @@ function scanFarmObjects(radius)
                         end
 
                         if hp and hp > 0 then
+                            local rarity = readRarityValue(source) or readRarityValue(targetPart) or "Unknown"
+                            local mutation = readMutationValue(source) or readMutationValue(targetPart) or "-"
+                            if weatherMutationTarget then
+                                local matchesWeatherMutation = doesMutationMatchWeatherTarget(mutation, weatherMutationTarget)
+                                if not matchesWeatherMutation then
+                                    local requiredMutation = normalizeFarmTreeText(weatherMutationTarget.mutation or "")
+                                    if requiredMutation ~= "" then
+                                        local displayText = normalizeFarmTreeText(displayName)
+                                        local sourceText = normalizeFarmTreeText(source.Name)
+                                        local partText = normalizeFarmTreeText(targetPart.Name)
+                                        if string.find(displayText, requiredMutation, 1, true)
+                                            or string.find(sourceText, requiredMutation, 1, true)
+                                            or string.find(partText, requiredMutation, 1, true) then
+                                            matchesWeatherMutation = true
+                                        end
+                                    end
+                                end
+                                if not matchesWeatherMutation then
+                                    continue
+                                end
+                            end
                             table.insert(results, {
                                 instance = source,
                                 part = targetPart,
@@ -4075,7 +4633,8 @@ function scanFarmObjects(radius)
                                 displayName = displayName,
                                 hp = hp,
                                 maxHp = readMaxHealthValue(source) or readMaxHealthValue(targetPart),
-                                rarity = readRarityValue(source) or readRarityValue(targetPart) or "Unknown",
+                                rarity = rarity,
+                                mutation = mutation,
                                 distance = distance,
                                 position = targetPart.Position
                             })
@@ -4086,12 +4645,7 @@ function scanFarmObjects(radius)
         end
     end
 
-    table.sort(results, function(a, b)
-        if a.hp == b.hp then
-            return a.distance < b.distance
-        end
-        return a.hp > b.hp
-    end)
+    table.sort(results, compareFarmTargets)
 
     return results, cooldownSkippedCount
 end
@@ -4549,7 +5103,7 @@ setButtonStyle(toggleButton, Theme.Success)
 toggleButton.TextColor3 = Color3.fromRGB(20, 26, 20)
 toggleButton.Parent = mainPage
 
- hotkeyLabel = Instance.new("TextLabel")
+hotkeyLabel = Instance.new("TextLabel")
 hotkeyLabel.Size = UDim2.new(1, 0, 0, 20)
 hotkeyLabel.Text = "Hotkey: F = Auto Click, K = Auto Farm"
 styleTextLabel(hotkeyLabel, 12, Theme.MutedText, false)
@@ -4668,8 +5222,211 @@ function teleportToZone(zone)
         return
     end
 
-    hrp.CFrame = bounds.CFrame + Vector3.new(0, 5, 0)
+    local basePosition = bounds.Position
+    local isWinterneedle = normalizeFarmTreeText(zone.folder or zone.name or "") == "winterneedle"
+    local rayStartHeight = isWinterneedle and 220 or 120
+    local raycastLength = isWinterneedle and 900 or 600
+
+    local targetPosition = basePosition + Vector3.new(0, isWinterneedle and 60 or 8, 0)
+    local rayOrigin = basePosition + Vector3.new(0, rayStartHeight, 0)
+
+    local rayParams = RaycastParams.new()
+    rayParams.FilterType = Enum.RaycastFilterType.Exclude
+    local excludeList = {character, bounds}
+    if playerBounds then
+        table.insert(excludeList, playerBounds)
+    end
+    rayParams.FilterDescendantsInstances = excludeList
+
+    local hitResult = workspace:Raycast(rayOrigin, Vector3.new(0, -raycastLength, 0), rayParams)
+    if hitResult then
+        local groundLift = isWinterneedle and 10 or 7
+        targetPosition = Vector3.new(basePosition.X, hitResult.Position.Y + groundLift, basePosition.Z)
+    end
+
+    hrp.CFrame = CFrame.new(targetPosition)
     print("Teleported to " .. zone.name)
+end
+
+function findZoneIndexByWeatherName(zoneName)
+    local normalizedZone = normalizeFarmTreeText(zoneName)
+    if normalizedZone == "" then
+        return nil
+    end
+
+    local bestIndex = nil
+    local bestScore = -1
+    for i, zone in ipairs(zones) do
+        local zoneText = normalizeFarmTreeText(zone.name or zone.folder or "")
+        local score = 0
+        if zoneText == normalizedZone then
+            score = 100
+        elseif string.find(zoneText, normalizedZone, 1, true) or string.find(normalizedZone, zoneText, 1, true) then
+            score = 80
+        else
+            score = countSharedTokens(zoneText, normalizedZone) * 12
+        end
+
+        if score > bestScore then
+            bestScore = score
+            bestIndex = i
+        end
+    end
+
+    if bestScore < 18 then
+        return nil
+    end
+    return bestIndex
+end
+
+function parseWeatherMutationEventText(text)
+    local cleaned = cleanGuiText(text)
+    if cleaned == "" then
+        return nil
+    end
+
+    local lowerText = string.lower(cleaned)
+    if not string.find(lowerText, "weather:", 1, true) or not string.find(lowerText, "mutated", 1, true) then
+        return nil
+    end
+
+    local zoneName, mutationName = string.match(cleaned, "[Ww]eather:%s*[Aa]%s+tree%s+in%s+(.+)%s+mutated%s+to%s+(.+)")
+    if not zoneName then
+        zoneName, mutationName = string.match(cleaned, "[Ww]eather:%s*(.+)%s+mutated%s+to%s+(.+)")
+    end
+    if not zoneName or not mutationName then
+        return nil
+    end
+
+    zoneName = cleanGuiText(zoneName)
+    mutationName = cleanGuiText(mutationName)
+    mutationName = string.gsub(mutationName, "[%.,!%?]+$", "")
+    mutationName = cleanGuiText(mutationName)
+    if zoneName == "" or mutationName == "" then
+        return nil
+    end
+
+    return {
+        zoneName = zoneName,
+        mutation = mutationName,
+        message = cleaned,
+        key = string.lower(cleaned)
+    }
+end
+
+function scanLatestWeatherMutationEvent()
+    local now = os.clock()
+    if now - (FarmState.LastWeatherMutationScanAt or 0) < (Settings.WeatherMutationScanInterval or 0.45) then
+        return nil
+    end
+    FarmState.LastWeatherMutationScanAt = now
+
+    local bestEvent = nil
+    local bestY = -math.huge
+    for _, root in ipairs(getFarmUiScanRoots()) do
+        if root then
+            local descendants = nil
+            pcall(function()
+                descendants = root:GetDescendants()
+            end)
+            if descendants then
+                for _, obj in ipairs(descendants) do
+                    if (obj:IsA("TextLabel") or obj:IsA("TextButton")) and obj.Visible then
+                        local parsed = parseWeatherMutationEventText(obj.Text or "")
+                        if parsed then
+                            local y = 0
+                            pcall(function()
+                                y = obj.AbsolutePosition.Y
+                            end)
+                            if not bestEvent or y >= bestY then
+                                bestEvent = parsed
+                                bestY = y
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    if not bestEvent then
+        return nil
+    end
+
+    local repeatBlock = Settings.WeatherMutationRepeatBlockSeconds or 180
+    if FarmState.LastWeatherMutationMessageKey == bestEvent.key
+        and now - (FarmState.LastWeatherMutationMessageAt or 0) < repeatBlock then
+        return nil
+    end
+
+    FarmState.LastWeatherMutationMessageKey = bestEvent.key
+    FarmState.LastWeatherMutationMessageAt = now
+    return bestEvent
+end
+
+function applyWeatherMutationEvent(event)
+    if not event then
+        return false
+    end
+
+    local zoneIndex = findZoneIndexByWeatherName(event.zoneName)
+    if not zoneIndex then
+        FarmState.LastConflictText = "Weather event terdeteksi tapi zone tidak dikenali: " .. tostring(event.zoneName)
+        FarmState.LastConflictAt = os.clock()
+        return false
+    end
+
+    local mutationText = cleanGuiText(event.mutation)
+    local mutationNormalized = normalizeFarmTreeText(mutationText)
+    if mutationNormalized == "" then
+        return false
+    end
+
+    local now = os.clock()
+    FarmState.WeatherMutationTarget = {
+        zoneIndex = zoneIndex,
+        zoneName = zones[zoneIndex].name or zones[zoneIndex].folder,
+        mutation = mutationText,
+        mutationNormalized = mutationNormalized,
+        message = event.message,
+        detectedAt = now,
+        expiresAt = now + (Settings.WeatherMutationTargetLifetimeSeconds or 420)
+    }
+    FarmState.LastWeatherMutationHandledKey = event.key
+
+    FarmState.ZoneIndex = zoneIndex
+    if farmZoneButton then
+        farmZoneButton.Text = "Farm Zone: " .. zones[zoneIndex].name
+    end
+
+    FarmState.LastConflictText = string.format(
+        "Weather Hunt: %s | Mutation %s",
+        tostring(zones[zoneIndex].name),
+        tostring(mutationText)
+    )
+    FarmState.LastConflictAt = now
+
+    teleportToZone(zones[zoneIndex])
+    FarmState.LockedTarget = nil
+    FarmState.CurrentTarget = nil
+    FarmState.SkipRequested = false
+    if refreshFarmUiCallback then
+        refreshFarmUiCallback(true)
+    end
+    return true
+end
+
+function processWeatherMutationEvent()
+    if not FarmState.WeatherMutationEnabled then
+        return false
+    end
+
+    local event = scanLatestWeatherMutationEvent()
+    if not event then
+        return false
+    end
+
+    return applyWeatherMutationEvent(event)
 end
 
 for _, zone in ipairs(zones) do
@@ -4880,7 +5637,7 @@ farmTitle.Parent = farmInfoCard
  farmDesc = Instance.new("TextLabel")
 farmDesc.Size = UDim2.new(1, -14, 0, 28)
 farmDesc.Position = UDim2.new(0, 8, 0, 30)
- farmDesc.Text = "Auto Farm: TP zone -> lock tree -> chop. Bisa filter Target Tree (nama jenis pohon). No ByteNet packet = auto NEXT, plus skip bentrok 'already chopping', skip player radius dekat tree, skip action E/tap, skip popup Robux, cooldown respawn, dan tombol NEXT manual."
+ farmDesc.Text = "Auto Farm: TP zone -> lock tree -> chop. Target Tree bisa lebih dari 1 (pisah koma). No ByteNet packet = auto NEXT, plus skip bentrok 'already chopping', skip player radius dekat tree, skip action E/tap, skip popup Robux, cooldown respawn, dan tombol NEXT manual."
 farmDesc.TextWrapped = true
 styleTextLabel(farmDesc, 11, Theme.MutedText, false)
 farmDesc.Parent = farmInfoCard
@@ -4952,7 +5709,7 @@ farmTreeFilterInput.BackgroundColor3 = Theme.Background
 farmTreeFilterInput.BorderSizePixel = 0
 farmTreeFilterInput.Text = FarmState.TreeFilter ~= "" and FarmState.TreeFilter or ""
 farmTreeFilterInput.ClearTextOnFocus = false
-farmTreeFilterInput.PlaceholderText = "Kosong = semua | contoh: Blackthorn"
+farmTreeFilterInput.PlaceholderText = "Pisah koma | contoh: Blackthorn, Oak"
 farmTreeFilterInput.TextColor3 = Theme.Text
 farmTreeFilterInput.TextSize = 12
 farmTreeFilterInput.Font = Enum.Font.Gotham
@@ -4966,6 +5723,32 @@ farmZoneButton.Text = "Farm Zone: " .. zones[FarmState.ZoneIndex].name
 setButtonStyle(farmZoneButton, Theme.Surface)
 farmZoneButton.Parent = farmPage
 attachHover(farmZoneButton, Theme.Surface, Theme.SurfaceHover)
+
+farmPriorityButton = Instance.new("TextButton")
+farmPriorityButton.Size = UDim2.new(1, 0, 0, 36)
+farmPriorityButton.Text = "Priority: " .. getFarmPriorityModeLabel(FarmState.PriorityMode)
+setButtonStyle(farmPriorityButton, Theme.Surface)
+farmPriorityButton.Parent = farmPage
+attachHover(farmPriorityButton, Theme.Surface, Theme.SurfaceHover)
+
+farmWeatherToggleButton = Instance.new("TextButton")
+farmWeatherToggleButton.Size = UDim2.new(1, 0, 0, 36)
+farmWeatherToggleButton.Text = "Weather Mutation Hunt: ON"
+setButtonStyle(farmWeatherToggleButton, Theme.Success)
+farmWeatherToggleButton.TextColor3 = Color3.fromRGB(20, 26, 20)
+farmWeatherToggleButton.Parent = farmPage
+
+farmEspToggleButton = Instance.new("TextButton")
+farmEspToggleButton.Size = UDim2.new(1, 0, 0, 36)
+farmEspToggleButton.Text = "Tree ESP: OFF"
+setButtonStyle(farmEspToggleButton, Theme.Surface)
+farmEspToggleButton.Parent = farmPage
+
+farmForceTreeInfoToggleButton = Instance.new("TextButton")
+farmForceTreeInfoToggleButton.Size = UDim2.new(1, 0, 0, 36)
+farmForceTreeInfoToggleButton.Text = "Force TreeInfo: OFF"
+setButtonStyle(farmForceTreeInfoToggleButton, Theme.Surface)
+farmForceTreeInfoToggleButton.Parent = farmPage
 
  farmScanButton = Instance.new("TextButton")
 farmScanButton.Size = UDim2.new(1, 0, 0, 40)
@@ -5020,7 +5803,7 @@ styleTextLabel(treeLockLabel, 11, Theme.MutedText, false)
 treeLockLabel.Parent = treeLockCard
 
  farmListCard = Instance.new("Frame")
-farmListCard.Size = UDim2.new(1, 0, 0, 140)
+farmListCard.Size = UDim2.new(1, 0, 0, 220)
 farmListCard.BackgroundColor3 = Theme.Surface
 farmListCard.BorderSizePixel = 0
 farmListCard.Parent = farmPage
@@ -5035,6 +5818,72 @@ farmListLabel.TextWrapped = true
 farmListLabel.TextYAlignment = Enum.TextYAlignment.Top
 styleTextLabel(farmListLabel, 11, Theme.MutedText, false)
 farmListLabel.Parent = farmListCard
+
+farmInfoFloatFrame = Instance.new("Frame")
+farmInfoFloatFrame.Name = "FarmInfoPanel"
+farmInfoFloatFrame.Size = UDim2.new(0, 420, 0, 430)
+farmInfoFloatFrame.Position = UDim2.new(0.5, 230, 0, 84)
+farmInfoFloatFrame.BackgroundColor3 = Theme.Background
+farmInfoFloatFrame.BorderSizePixel = 0
+farmInfoFloatFrame.Active = true
+farmInfoFloatFrame.Draggable = true
+farmInfoFloatFrame.Visible = false
+farmInfoFloatFrame.ZIndex = 15
+farmInfoFloatFrame.Parent = screenGui
+addCorner(farmInfoFloatFrame, 12)
+addStroke(farmInfoFloatFrame, Theme.Border, 1, 0.15)
+
+farmInfoFloatHeader = Instance.new("Frame")
+farmInfoFloatHeader.Size = UDim2.new(1, 0, 0, 34)
+farmInfoFloatHeader.BackgroundColor3 = Theme.Header
+farmInfoFloatHeader.BorderSizePixel = 0
+farmInfoFloatHeader.Parent = farmInfoFloatFrame
+farmInfoFloatHeader.ZIndex = 16
+addCorner(farmInfoFloatHeader, 12)
+
+farmInfoFloatHeaderMask = Instance.new("Frame")
+farmInfoFloatHeaderMask.Size = UDim2.new(1, 0, 0, 10)
+farmInfoFloatHeaderMask.Position = UDim2.new(0, 0, 1, -10)
+farmInfoFloatHeaderMask.BackgroundColor3 = Theme.Header
+farmInfoFloatHeaderMask.BorderSizePixel = 0
+farmInfoFloatHeaderMask.Parent = farmInfoFloatHeader
+farmInfoFloatHeaderMask.ZIndex = 16
+
+farmInfoFloatTitle = Instance.new("TextLabel")
+farmInfoFloatTitle.Size = UDim2.new(1, -12, 1, 0)
+farmInfoFloatTitle.Position = UDim2.new(0, 8, 0, 0)
+farmInfoFloatTitle.Text = "Farm Info (Drag)"
+styleTextLabel(farmInfoFloatTitle, 12, Theme.Text, true)
+farmInfoFloatTitle.TextXAlignment = Enum.TextXAlignment.Left
+farmInfoFloatTitle.Parent = farmInfoFloatHeader
+farmInfoFloatTitle.ZIndex = 17
+
+farmInfoFloatBody = Instance.new("Frame")
+farmInfoFloatBody.Size = UDim2.new(1, -10, 1, -40)
+farmInfoFloatBody.Position = UDim2.new(0, 5, 0, 36)
+farmInfoFloatBody.BackgroundTransparency = 1
+farmInfoFloatBody.Parent = farmInfoFloatFrame
+farmInfoFloatBody.ZIndex = 16
+
+farmCooldownLabel.Parent = farmInfoFloatBody
+farmCooldownLabel.Size = UDim2.new(1, -10, 0, 20)
+farmCooldownLabel.Position = UDim2.new(0, 5, 0, 0)
+farmCooldownLabel.ZIndex = 17
+
+treeLockCard.Parent = farmInfoFloatBody
+treeLockCard.Size = UDim2.new(1, 0, 0, 132)
+treeLockCard.Position = UDim2.new(0, 0, 0, 24)
+treeLockCard.ZIndex = 16
+
+treeLockTitle.ZIndex = 17
+treeLockLabel.ZIndex = 17
+
+farmListCard.Parent = farmInfoFloatBody
+farmListCard.Size = UDim2.new(1, 0, 1, -164)
+farmListCard.Position = UDim2.new(0, 0, 0, 164)
+farmListCard.ZIndex = 16
+
+farmListLabel.ZIndex = 17
 
  farmToggleButton = Instance.new("TextButton")
 farmToggleButton.Size = UDim2.new(1, 0, 0, 44)
@@ -5322,11 +6171,7 @@ end
 
 function applyFarmTreeFilterFromInput(shouldPersist)
     local rawFilter = farmTreeFilterInput and farmTreeFilterInput.Text or FarmState.TreeFilter
-    rawFilter = string.gsub(tostring(rawFilter or ""), "^%s*(.-)%s*$", "%1")
-    local lowerFilter = string.lower(rawFilter)
-    if lowerFilter == "all" or lowerFilter == "semua" then
-        rawFilter = ""
-    end
+    rawFilter = normalizeFarmTreeFilterInput(rawFilter)
     FarmState.TreeFilter = rawFilter
     if farmTreeFilterInput and farmTreeFilterInput.Text ~= rawFilter then
         farmTreeFilterInput.Text = rawFilter
@@ -5635,19 +6480,21 @@ function buildTreeLockText(target)
     local displayName = target.displayName or attrs.TreeName or target.name or instance.Name
     local seed = attrs.Seed or "-"
     local imposterId = attrs.ImposterId or "-"
-    local breakPoint = attrs.BreakPoint or attrs.Breakpoint or target.hp or "-"
+    local hpValue = target.hp or readHealthValue(instance) or attrs.BreakPoint or attrs.Breakpoint or "-"
     local typeIndex = attrs.TreeTypeIndex or "-"
     local rarity = target.rarity or attrs.Rarity or "Unknown"
+    local mutation = target.mutation or attrs.Mutation or attrs.Mutations or "-"
     local positionText = target.position and formatPosition(target.position) or "-"
 
     local text = string.format(
-        "Mode: Hard Lock\nLOCK: %s\nTreeName: %s | Rarity: %s\nSeed: %s | ImposterId: %s\nBreakPoint: %s | Type: %s\nPos: %s",
+        "Mode: Hard Lock\nLOCK: %s\nTreeName: %s | Rarity: %s | Mutation: %s\nSeed: %s | ImposterId: %s\nHP: %s | Type: %s\nPos: %s",
         target.name or instance.Name,
         tostring(displayName),
         tostring(rarity),
+        tostring(mutation),
         tostring(seed),
         tostring(imposterId),
-        tostring(breakPoint),
+        tostring(hpValue),
         tostring(typeIndex),
         tostring(positionText)
     )
@@ -5678,6 +6525,10 @@ updateFarmView = function(force)
     end
     farmViewLastRefreshAt = now
 
+    if farmInfoFloatFrame then
+        farmInfoFloatFrame.Visible = (not UIState.Minimized) and (UIState.CurrentTab == "Farm" or FarmState.Active)
+    end
+
     if FarmState.Active then
         if isSellPassRunning() then
             farmStatusLabel.Text = "Farm Status: PAUSED (SELL)"
@@ -5697,14 +6548,56 @@ updateFarmView = function(force)
         farmToggleButton.TextColor3 = Color3.fromRGB(25, 25, 25)
     end
 
+    FarmState.PriorityMode = normalizeFarmPriorityMode(FarmState.PriorityMode)
+    farmPriorityButton.Text = "Priority: " .. getFarmPriorityModeLabel(FarmState.PriorityMode)
+    if FarmState.PriorityMode == "RARITY" then
+        farmPriorityButton.BackgroundColor3 = Theme.Primary
+        farmPriorityButton.TextColor3 = Theme.Text
+    else
+        farmPriorityButton.BackgroundColor3 = Theme.Surface
+        farmPriorityButton.TextColor3 = Theme.Text
+    end
+
+    if FarmState.WeatherMutationEnabled then
+        farmWeatherToggleButton.Text = "Weather Mutation Hunt: ON"
+        farmWeatherToggleButton.BackgroundColor3 = Theme.Success
+        farmWeatherToggleButton.TextColor3 = Color3.fromRGB(20, 26, 20)
+    else
+        farmWeatherToggleButton.Text = "Weather Mutation Hunt: OFF"
+        farmWeatherToggleButton.BackgroundColor3 = Theme.Surface
+        farmWeatherToggleButton.TextColor3 = Theme.Text
+    end
+
+    if FarmState.EspEnabled then
+        farmEspToggleButton.Text = "Tree ESP: ON"
+        farmEspToggleButton.BackgroundColor3 = Theme.Primary
+        farmEspToggleButton.TextColor3 = Theme.Text
+    else
+        farmEspToggleButton.Text = "Tree ESP: OFF"
+        farmEspToggleButton.BackgroundColor3 = Theme.Surface
+        farmEspToggleButton.TextColor3 = Theme.Text
+    end
+
+    if FarmState.ForceTreeInfoEnabled then
+        farmForceTreeInfoToggleButton.Text = "Force TreeInfo: ON"
+        farmForceTreeInfoToggleButton.BackgroundColor3 = Theme.Success
+        farmForceTreeInfoToggleButton.TextColor3 = Color3.fromRGB(20, 26, 20)
+    else
+        farmForceTreeInfoToggleButton.Text = "Force TreeInfo: OFF"
+        farmForceTreeInfoToggleButton.BackgroundColor3 = Theme.Surface
+        farmForceTreeInfoToggleButton.TextColor3 = Theme.Text
+    end
+
     local target = FarmState.CurrentTarget or FarmState.ScanResults[1]
     if target then
         local hpText = target.maxHp and string.format("%.0f/%.0f", target.hp, target.maxHp) or string.format("%.0f", target.hp)
+        local mutationText = target.mutation or "-"
         farmTargetLabel.Text = string.format(
-            "Target: %s | HP %s | Rarity %s | Pos %s",
+            "Target: %s | HP %s | Rarity %s | Mutation %s | Pos %s",
             target.displayName or target.name,
             hpText,
             target.rarity,
+            mutationText,
             formatPosition(target.position)
         )
         farmTargetLabel.TextColor3 = Theme.Text
@@ -5740,18 +6633,25 @@ updateFarmView = function(force)
         farmListLabel.TextColor3 = Theme.MutedText
     else
         local lines = {}
-        local maxLines = math.min(6, #FarmState.ScanResults)
+        local configuredLines = math.clamp(math.floor(tonumber(Settings.FarmUiListMaxLines) or 12), 3, 40)
+        local maxLines = math.min(configuredLines, #FarmState.ScanResults)
         for i = 1, maxLines do
             local item = FarmState.ScanResults[i]
             local hpText = item.maxHp and string.format("%.0f/%.0f", item.hp, item.maxHp) or string.format("%.0f", item.hp)
+            local mutationText = item.mutation or "-"
             lines[#lines + 1] = string.format(
-                "%d) %s | HP %s | Rarity %s | %s",
+                "%d) %s | HP %s | Rarity %s | Mutation %s | %s",
                 i,
                 item.displayName or item.name,
                 hpText,
                 item.rarity,
+                mutationText,
                 formatPosition(item.position)
             )
+        end
+
+        if #FarmState.ScanResults > maxLines then
+            lines[#lines + 1] = string.format("... +%d target lainnya", #FarmState.ScanResults - maxLines)
         end
 
         farmListLabel.Text = table.concat(lines, "\n")
@@ -5836,6 +6736,424 @@ end
 
 refreshFarmUiCallback = updateFarmView
 
+function destroyFarmEspEntry(key)
+    local entry = farmEspEntries[key]
+    if not entry then
+        return
+    end
+
+    farmEspEntries[key] = nil
+    local gui = entry.gui
+    if gui then
+        pcall(function()
+            gui:Destroy()
+        end)
+    end
+end
+
+function clearFarmEspEntries()
+    for key in pairs(farmEspEntries) do
+        destroyFarmEspEntry(key)
+    end
+end
+
+function collectTreeInfoNodes(container)
+    local nodes = {}
+    local seen = {}
+    local function pushNode(node)
+        if node and not seen[node] then
+            seen[node] = true
+            nodes[#nodes + 1] = node
+        end
+    end
+
+    if not container then
+        return nodes
+    end
+
+    pushNode(container:FindFirstChild("TreeInfo", true))
+    pushNode(container:FindFirstChild("TreeHealth", true))
+
+    local origin = container:FindFirstChild("Origin", true)
+    if origin then
+        pushNode(origin:FindFirstChild("TreeInfo", true))
+        pushNode(origin:FindFirstChild("TreeHealth", true))
+    end
+
+    return nodes
+end
+
+function setTreeInfoNodeVisible(node)
+    if not node then
+        return false
+    end
+
+    local touched = false
+    local function applyVisibility(obj)
+        if obj:IsA("BillboardGui") or obj:IsA("SurfaceGui") then
+            pcall(function()
+                obj.Enabled = true
+            end)
+            touched = true
+        end
+        if obj:IsA("GuiObject") then
+            pcall(function()
+                obj.Visible = true
+            end)
+            touched = true
+        end
+    end
+
+    applyVisibility(node)
+    local descendants = nil
+    pcall(function()
+        descendants = node:GetDescendants()
+    end)
+    if descendants then
+        for _, desc in ipairs(descendants) do
+            applyVisibility(desc)
+        end
+    end
+
+    return touched
+end
+
+function forceTreeInfoForTarget(target)
+    if not target then
+        return false
+    end
+
+    local source = target.instance or target.part
+    if not source then
+        return false
+    end
+
+    local touchedAny = false
+    local nodes = collectTreeInfoNodes(source)
+    if #nodes == 0 and target.part and target.part.Parent then
+        nodes = collectTreeInfoNodes(target.part)
+    end
+
+    for _, node in ipairs(nodes) do
+        if setTreeInfoNodeVisible(node) then
+            touchedAny = true
+        end
+    end
+
+    return touchedAny
+end
+
+function applyForceTreeInfoToResults(results)
+    if not FarmState.ForceTreeInfoEnabled then
+        return
+    end
+
+    local list = results or {}
+    local maxTargets = math.clamp(math.floor(tonumber(Settings.ForceTreeInfoMaxTargets) or 25), 3, 120)
+    for i = 1, math.min(maxTargets, #list) do
+        local target = list[i]
+        if target and target.part and target.part.Parent then
+            forceTreeInfoForTarget(target)
+        end
+    end
+end
+
+function getFarmEspEntryKey(target)
+    if not target then
+        return nil
+    end
+
+    local key = target.key
+    if type(key) == "string" and key ~= "" then
+        return key
+    end
+
+    local builtKey = buildFarmTargetKey(target.instance, target.part)
+    if builtKey and builtKey ~= "" then
+        return builtKey
+    end
+
+    local root = target.instance or target.part
+    if root then
+        local path = nil
+        pcall(function()
+            path = root:GetFullName()
+        end)
+        if path and path ~= "" then
+            return path
+        end
+    end
+
+    return nil
+end
+
+function buildFarmEspText(target)
+    local displayName = cleanGuiText(target.displayName or target.name or "Tree")
+    if displayName == "" then
+        displayName = "Tree"
+    end
+
+    local idText = cleanGuiText(tostring(target.name or (target.instance and target.instance.Name) or ""))
+    if idText == "" and target.instance and target.instance.Parent then
+        local imposterId = target.instance:GetAttribute("ImposterId")
+        if imposterId then
+            local baseName = cleanGuiText(tostring(target.displayName or target.instance:GetAttribute("TreeName") or "tree"))
+            baseName = normalizeFarmTreeText(baseName)
+            if baseName == "" then
+                baseName = "tree"
+            end
+            baseName = string.gsub(baseName, "%s+", "_")
+            idText = string.format("%s_%s", baseName, tostring(imposterId))
+        end
+    end
+    if idText == "" then
+        idText = "-"
+    elseif #idText > 36 then
+        idText = string.sub(idText, 1, 33) .. "..."
+    end
+
+    local hpValue = tonumber(target.hp)
+    local maxHpValue = tonumber(target.maxHp)
+    if (not hpValue or hpValue <= 0) and target.instance and target.instance.Parent then
+        hpValue = tonumber(readHealthValue(target.instance))
+    end
+    if (not maxHpValue or maxHpValue <= 0) and target.instance and target.instance.Parent then
+        maxHpValue = tonumber(readMaxHealthValue(target.instance))
+    end
+
+    local hpText = "-"
+    if hpValue and hpValue > 0 then
+        if maxHpValue and maxHpValue > 0 then
+            hpText = string.format("%.0f/%.0f", hpValue, maxHpValue)
+        else
+            hpText = string.format("%.0f", hpValue)
+        end
+    end
+
+    local rarityText = cleanGuiText(tostring(target.rarity or "Unknown"))
+    if rarityText == "" then
+        rarityText = "Unknown"
+    end
+
+    return string.format("%s\nID %s\nHP %s | Rarity %s", displayName, idText, hpText, rarityText)
+end
+
+function upsertFarmEspEntry(key, target)
+    if not key or key == "" or not target or not target.part or not target.part.Parent then
+        return
+    end
+    if not screenGui or screenGui.Parent == nil then
+        return
+    end
+
+    local entry = farmEspEntries[key]
+    if entry and (not entry.gui or entry.gui.Parent == nil) then
+        entry = nil
+        farmEspEntries[key] = nil
+    end
+
+    if not entry then
+        local gui = Instance.new("BillboardGui")
+        gui.Name = "TreeEspInfo"
+        gui.Size = UDim2.new(0, 240, 0, 74)
+        gui.StudsOffset = Vector3.new(0, 4.2, 0)
+        gui.AlwaysOnTop = true
+        gui.Parent = screenGui
+
+        local frame = Instance.new("Frame")
+        frame.Size = UDim2.new(1, 0, 1, 0)
+        frame.BackgroundColor3 = Theme.Header
+        frame.BackgroundTransparency = 0.22
+        frame.BorderSizePixel = 0
+        frame.Parent = gui
+        addCorner(frame, 8)
+        addStroke(frame, Theme.Border, 1, 0.25)
+
+        local label = Instance.new("TextLabel")
+        label.Size = UDim2.new(1, -8, 1, -6)
+        label.Position = UDim2.new(0, 4, 0, 3)
+        label.TextWrapped = true
+        label.TextYAlignment = Enum.TextYAlignment.Top
+        styleTextLabel(label, 11, Theme.Text, true)
+        label.Parent = frame
+
+        entry = {
+            gui = gui,
+            label = label,
+            instance = target.instance
+        }
+        farmEspEntries[key] = entry
+    end
+
+    local maxDistance = tonumber(Settings.FarmEspMaxDistance) or 420
+    local radiusDistance = (tonumber(FarmState.Radius) or 120) + 90
+    maxDistance = math.max(120, maxDistance, radiusDistance)
+
+    entry.instance = target.instance
+    entry.gui.MaxDistance = maxDistance
+    entry.gui.Adornee = target.part
+    entry.label.Text = buildFarmEspText(target)
+    entry.label.TextColor3 = (target.mutation and target.mutation ~= "" and target.mutation ~= "-") and Theme.Success or Theme.Text
+end
+
+function updateFarmEspTargets(results)
+    if not FarmState.EspEnabled then
+        clearFarmEspEntries()
+        return
+    end
+
+    if not results then
+        results = {}
+    end
+
+    local visibleKeys = {}
+    local maxEntries = math.clamp(math.floor(tonumber(Settings.FarmEspMaxEntries) or 30), 5, 120)
+    for i = 1, math.min(maxEntries, #results) do
+        local target = results[i]
+        if target and target.part and target.part.Parent then
+            local key = getFarmEspEntryKey(target)
+            if key then
+                visibleKeys[key] = true
+                upsertFarmEspEntry(key, target)
+            end
+        end
+    end
+
+    for key in pairs(farmEspEntries) do
+        if not visibleKeys[key] then
+            destroyFarmEspEntry(key)
+        end
+    end
+end
+
+function setFarmEspEnabled(enabled)
+    FarmState.EspEnabled = enabled and true or false
+    if not FarmState.EspEnabled then
+        clearFarmEspEntries()
+        if refreshFarmUiCallback then
+            refreshFarmUiCallback(true)
+        end
+        return
+    end
+
+    if farmEspRunning then
+        if refreshFarmUiCallback then
+            refreshFarmUiCallback(true)
+        end
+        return
+    end
+
+    farmEspRunning = true
+    task.spawn(function()
+        while FarmState.EspEnabled do
+            if not screenGui or screenGui.Parent == nil then
+                break
+            end
+
+            applyFarmRadiusFromInput(false)
+            applyFarmTreeFilterFromInput(false)
+
+            local scanResults = nil
+            if FarmState.Active and type(FarmState.ScanResults) == "table" and #FarmState.ScanResults > 0 then
+                scanResults = FarmState.ScanResults
+            else
+                scanResults = scanFarmObjects(FarmState.Radius)
+                if not FarmState.Active then
+                    FarmState.ScanResults = scanResults
+                    FarmState.CurrentTarget = scanResults[1]
+                end
+            end
+
+            updateFarmEspTargets(scanResults)
+            if not FarmState.Active and refreshFarmUiCallback then
+                refreshFarmUiCallback()
+            end
+
+            local waitSeconds = tonumber(Settings.FarmEspRefreshInterval) or 0.65
+            waitSeconds = math.clamp(waitSeconds, 0.2, 3)
+            local startedAt = os.clock()
+            while FarmState.EspEnabled and (os.clock() - startedAt) < waitSeconds do
+                task.wait(0.05)
+            end
+        end
+
+        clearFarmEspEntries()
+        farmEspRunning = false
+        if not screenGui or screenGui.Parent == nil then
+            FarmState.EspEnabled = false
+        end
+        if refreshFarmUiCallback then
+            refreshFarmUiCallback(true)
+        end
+    end)
+
+    if refreshFarmUiCallback then
+        refreshFarmUiCallback(true)
+    end
+end
+
+function setForceTreeInfoEnabled(enabled)
+    FarmState.ForceTreeInfoEnabled = enabled and true or false
+
+    if not FarmState.ForceTreeInfoEnabled then
+        if refreshFarmUiCallback then
+            refreshFarmUiCallback(true)
+        end
+        return
+    end
+
+    if forceTreeInfoRunning then
+        if refreshFarmUiCallback then
+            refreshFarmUiCallback(true)
+        end
+        return
+    end
+
+    forceTreeInfoRunning = true
+    task.spawn(function()
+        while FarmState.ForceTreeInfoEnabled do
+            if not screenGui or screenGui.Parent == nil then
+                break
+            end
+
+            applyFarmRadiusFromInput(false)
+            applyFarmTreeFilterFromInput(false)
+
+            local scanResults = nil
+            if FarmState.Active and type(FarmState.ScanResults) == "table" and #FarmState.ScanResults > 0 then
+                scanResults = FarmState.ScanResults
+            else
+                scanResults = scanFarmObjects(FarmState.Radius)
+                if not FarmState.Active then
+                    FarmState.ScanResults = scanResults
+                    FarmState.CurrentTarget = scanResults[1]
+                end
+            end
+
+            applyForceTreeInfoToResults(scanResults)
+
+            local waitSeconds = tonumber(Settings.ForceTreeInfoRefreshInterval) or 0.6
+            waitSeconds = math.clamp(waitSeconds, 0.2, 3)
+            local startedAt = os.clock()
+            while FarmState.ForceTreeInfoEnabled and (os.clock() - startedAt) < waitSeconds do
+                task.wait(0.05)
+            end
+        end
+
+        forceTreeInfoRunning = false
+        if not screenGui or screenGui.Parent == nil then
+            FarmState.ForceTreeInfoEnabled = false
+        end
+        if refreshFarmUiCallback then
+            refreshFarmUiCallback(true)
+        end
+    end)
+
+    if refreshFarmUiCallback then
+        refreshFarmUiCallback(true)
+    end
+end
+
 function runFarmScan()
     applyFarmRadiusFromInput(false)
     applyFarmTreeFilterFromInput(false)
@@ -5861,6 +7179,10 @@ function runFarmScan()
     FarmState.ScanResults = scanResults
     FarmState.LastCooldownSkipped = totalSkippedCooldown
     FarmState.CurrentTarget = FarmState.ScanResults[1]
+    applyForceTreeInfoToResults(FarmState.ScanResults)
+    if FarmState.EspEnabled then
+        updateFarmEspTargets(FarmState.ScanResults)
+    end
     updateFarmView()
     return FarmState.CurrentTarget
 end
@@ -5892,8 +7214,17 @@ function runHarvestScan()
 end
 
 function runHarvestReturnToPlot()
+    local plotPart = getPlayerPlotPart(false)
+    if not plotPart then
+        plotPart = getPlayerPlotPart(true)
+    end
+
+    if plotPart and isCharacterNearPart(plotPart, Settings.HarvestPlotArrivalDistance) then
+        return true, false
+    end
+
     if teleportToPlayerPlot() then
-        return true
+        return true, true
     end
 
     local zone = zones[FarmState.ZoneIndex]
@@ -5902,7 +7233,20 @@ function runHarvestReturnToPlot()
         task.wait(0.35)
     end
 
-    return false
+    return false, false
+end
+
+function waitHarvestPostTeleportDelay()
+    local delaySeconds = tonumber(Settings.HarvestPostTeleportDelaySeconds) or 0
+    delaySeconds = math.clamp(delaySeconds, 0, 20)
+    if delaySeconds <= 0 then
+        return
+    end
+
+    local startedAt = os.clock()
+    while HarvestState.Active and (os.clock() - startedAt) < delaySeconds do
+        task.wait(0.1)
+    end
 end
 
 function pauseFarmForSellIfNeeded()
@@ -5945,16 +7289,23 @@ function setHarvestEnabled(enabled)
     updateFarmView(true)
 
     if not HarvestState.WaitingCacheReset then
-        runHarvestReturnToPlot()
+        local arrivedAtPlot, didTeleport = runHarvestReturnToPlot()
+        if arrivedAtPlot and didTeleport then
+            waitHarvestPostTeleportDelay()
+        end
     end
 
     task.spawn(function()
         while HarvestState.Active do
             unequipAllTools()
             if not HarvestState.WaitingCacheReset then
-                if not runHarvestReturnToPlot() then
+                local arrivedAtPlot, didTeleport = runHarvestReturnToPlot()
+                if not arrivedAtPlot then
                     task.wait(0.35)
                     continue
+                end
+                if didTeleport then
+                    waitHarvestPostTeleportDelay()
                 end
             else
                 task.wait(0.15)
@@ -5975,8 +7326,6 @@ function setHarvestEnabled(enabled)
                 local interacted = false
                 if target.prompt and target.prompt.Parent then
                     interacted = sendInteractAction(target.prompt)
-                else
-                    interacted = sendInteractAction(nil)
                 end
 
                 if interacted then
@@ -6011,6 +7360,10 @@ function setFarmEnabled(enabled)
         FarmState.LastBusyToastScanAt = 0
         FarmState.LastBusyToastText = nil
         FarmState.LastWideScanAt = 0
+        FarmState.LastWeatherMutationMessageKey = nil
+        FarmState.LastWeatherMutationMessageAt = 0
+        FarmState.LastWeatherMutationHandledKey = nil
+        FarmState.WeatherMutationTarget = nil
         clearFarmPacketWatch()
         unequipAllTools()
         updateFarmView(true)
@@ -6029,6 +7382,11 @@ function setFarmEnabled(enabled)
     FarmState.LastBusyToastScanAt = 0
     FarmState.LastBusyToastText = nil
     FarmState.LastWideScanAt = 0
+    FarmState.LastWeatherMutationScanAt = 0
+    FarmState.LastWeatherMutationMessageKey = nil
+    FarmState.LastWeatherMutationMessageAt = 0
+    FarmState.LastWeatherMutationHandledKey = nil
+    FarmState.WeatherMutationTarget = nil
     startFarmPacketWatch()
     resetFarmPacketTimer()
     equipToolSlotOne()
@@ -6050,6 +7408,14 @@ function setFarmEnabled(enabled)
             end
             if FarmState.SkipRequested and not FarmState.LockedTarget then
                 FarmState.SkipRequested = false
+            end
+
+            if processWeatherMutationEvent() then
+                didInitialZoneTeleport = true
+                nextZoneTeleportAt = os.clock() + 4.5
+                missedScans = 0
+                task.wait(0.25)
+                continue
             end
 
             if not didInitialZoneTeleport then
@@ -6109,6 +7475,10 @@ function setFarmEnabled(enabled)
                 while FarmState.Active do
                     if FarmState.SkipRequested then
                         FarmState.SkipRequested = false
+                        break
+                    end
+
+                    if processWeatherMutationEvent() then
                         break
                     end
 
@@ -6288,6 +7658,9 @@ function applyLayoutState()
         tabContainer.Visible = false
         content.Visible = false
         minimizeButton.Text = "+"
+        if farmInfoFloatFrame then
+            farmInfoFloatFrame.Visible = false
+        end
         return
     end
 
@@ -6319,6 +7692,10 @@ function applyLayoutState()
     setTabStyle(harvestTabButton, onHarvest)
     setTabStyle(sellTabButton, onSell)
     setTabStyle(aboutTabButton, onAbout)
+
+    if farmInfoFloatFrame then
+        farmInfoFloatFrame.Visible = onFarm or FarmState.Active
+    end
 end
 
 function updateStatusView()
@@ -6464,6 +7841,57 @@ farmZoneButton.MouseButton1Click:Connect(function()
     requestConfigSave()
 end)
 
+farmPriorityButton.MouseButton1Click:Connect(function()
+    local currentMode = normalizeFarmPriorityMode(FarmState.PriorityMode)
+    if currentMode == "HP" then
+        FarmState.PriorityMode = "RARITY"
+    else
+        FarmState.PriorityMode = "HP"
+    end
+
+    FarmState.LockedTarget = nil
+    FarmState.CurrentTarget = nil
+    FarmState.SkipRequested = true
+    FarmState.LastConflictText = "Priority: " .. getFarmPriorityModeLabel(FarmState.PriorityMode)
+    FarmState.LastConflictAt = os.clock()
+
+    requestConfigSave()
+    runFarmScan()
+    updateFarmView(true)
+end)
+
+farmEspToggleButton.MouseButton1Click:Connect(function()
+    setFarmEspEnabled(not FarmState.EspEnabled)
+    requestConfigSave()
+    updateFarmView(true)
+end)
+
+farmForceTreeInfoToggleButton.MouseButton1Click:Connect(function()
+    setForceTreeInfoEnabled(not FarmState.ForceTreeInfoEnabled)
+    requestConfigSave()
+    updateFarmView(true)
+end)
+
+farmWeatherToggleButton.MouseButton1Click:Connect(function()
+    FarmState.WeatherMutationEnabled = not FarmState.WeatherMutationEnabled
+    if FarmState.WeatherMutationEnabled then
+        FarmState.LastWeatherMutationScanAt = 0
+        FarmState.LastWeatherMutationMessageKey = nil
+        FarmState.LastWeatherMutationMessageAt = 0
+        FarmState.LastWeatherMutationHandledKey = nil
+        FarmState.LastConflictText = "Weather hunt: ON"
+    else
+        FarmState.WeatherMutationTarget = nil
+        FarmState.LastWeatherMutationMessageKey = nil
+        FarmState.LastWeatherMutationMessageAt = 0
+        FarmState.LastWeatherMutationHandledKey = nil
+        FarmState.LastConflictText = "Weather hunt: OFF"
+    end
+    FarmState.LastConflictAt = os.clock()
+    requestConfigSave()
+    updateFarmView(true)
+end)
+
 farmRadiusInput.FocusLost:Connect(function()
     applyFarmRadiusFromInput(true)
 end)
@@ -6558,6 +7986,8 @@ closeButton.MouseButton1Click:Connect(function()
     saveConfigNow()
     setClickerEnabled(false)
     setFarmEnabled(false)
+    setFarmEspEnabled(false)
+    setForceTreeInfoEnabled(false)
     setHarvestEnabled(false)
     setSellEnabled(false)
 
@@ -6576,11 +8006,11 @@ closeButton.MouseButton1Click:Connect(function()
 end)
 
 trackConnection(UserInputService.InputBegan:Connect(function(input, gameProcessed)
-    if gameProcessed then
-        return
-    end
-
     if input.UserInputType == Enum.UserInputType.Keyboard then
+        if gameProcessed then
+            return
+        end
+
         if input.KeyCode == Settings.ToggleKey then
             toggleClickerMode()
             return
@@ -6601,5 +8031,7 @@ end))
 
 updateStatusView()
 updateFarmView()
+setFarmEspEnabled(FarmState.EspEnabled)
+setForceTreeInfoEnabled(FarmState.ForceTreeInfoEnabled)
 applyLayoutState()
 requestConfigSave()
